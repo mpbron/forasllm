@@ -1,0 +1,236 @@
+--- 
+title: LLM False Positives - FORAS
+author: 
+    name: Michiel Bron
+    email: m.p.bron@uu.nl
+format:
+    pdf:
+        documentclass: article
+        number-sections: true
+        fig-width: 6.5
+        fig-height: 3
+        pdf-engine: xelatex
+        pdf-engine-opt: -shell-escape
+        geometry:
+          - left=.75in
+          - right=.75in
+          - textwidth=4.5in
+          - marginparsep=.25in
+          - marginparwidth=2.25in
+        header-includes: |
+          \setmainfont{Fira Sans}
+          \setmonofont{Fira Code}
+          \setmathfont{Fira Math}
+          \setsansfont{Fira Sans}
+          \renewcommand{\familydefault}{\sfdefault}
+          \usepackage{minted}
+          \makeatletter
+          \let\listoflistings\@undefined
+          \makeatother
+          \setminted[r]{mathescape,linenos,frame=lines,framesep=2mm}
+          \setminted[python]{mathescape,linenos,frame=lines,framesep=2mm}
+          \usepackage{tikz}
+          \usepackage{tikzscale}
+          \usepackage{tikzsymbols}
+          \usetikzlibrary{positioning, fit, arrows.meta, shapes}
+          \usetikzlibrary{decorations.pathreplacing}
+          \newcommand{\empt}[2]{\textcolor{black}{$#1_{#2}$}}
+          \usepackage{stackrel}
+          \newcommand*{\cemph}[3]{%
+          \tikz[baseline=(X.base)] \node[rectangle, fill=#1, rounded corners, inner sep=0.5mm, fill opacity=0.5,draw opacity=1,text opacity=1] (X) {$\stackrel{\texttt{#2}}{\textsf{#3}}$};%
+          }
+date-format: long
+lang: en
+---
+
+```{r}
+#| include: false
+library(knitr)
+library(reticulate)
+library(tidyverse)
+use_python("./.venv/bin/python")
+options(dplyr.summarise.inform = FALSE)
+options(digits = 2, scipen=999)
+```
+
+```{python}
+#| include: false
+from functools import partial, reduce
+import operator
+from pathlib import Path
+from typing import Callable, FrozenSet, Mapping, Sequence, Tuple, TypeVar
+import pandas as pd
+from allib.benchmarking.reviews import read_review_dataset_new
+from environs import Env
+
+import pickle
+from allib_llm.visualization.highlights import write_highlightframe, write_results, write_slide, write_section, write_minipage
+from allib_llm.machinelearning.langchain import QAResult, string_to_trinary
+from allib_llm.datasets.foras import (
+    foras_to_env,
+    clean_up,
+    symbol_label_viewer,
+    char_to_trinary,
+)
+import instancelib as il
+from allib_llm.machinelearning.mockclassifier import MockClassifierWrapper
+from sklearn.metrics import confusion_matrix
+from trinary import weakly, Trinary, strictly
+from allib_llm.utils.instances import get_labeldiff, strong_inclusion_change, num_of_exclusions
+from instancelib.utils.func import value_map
+
+# %%
+POS = "Relevant"
+NEG = "Irrelevant"
+BPATH = Path("./data")
+DS_PATH = BPATH / "sourcedata" / "Motherfile_270224_V3.xlsx"
+DS_NAME = DS_PATH.stem
+ENV = Env()
+ENV.read_env(".env")
+ds_env = foras_to_env(DS_PATH)
+# %%
+basepath = BPATH / "llm_results" / "GPTModel.GPT35" / "questions"
+df_path = basepath / DS_NAME / "results.pkl"
+obj_path = basepath / DS_NAME / "results_obj.pkl"
+
+# %%
+with obj_path.open("rb") as fh:
+    objs: Sequence[QAResult] = pickle.load(fh)
+qa_dict = {o.key: o for o in objs}
+df = pd.read_pickle(df_path)
+mf = pd.read_excel(DS_PATH)
+cleaned = ds_env.to_pandas(
+    ds_env.dataset, labels=ds_env.truth, label_viewer=symbol_label_viewer()
+)
+
+
+# %%
+def answers_to_provider(anss: Sequence[QAResult]) -> il.LabelProvider[int, str]:
+    tuples = [(ans.key, ans.to_labels(["inclusions"])) for ans in anss]
+    provider = il.MemoryLabelProvider.from_tuples(tuples)
+    return provider
+
+
+_T = TypeVar("_T")
+
+
+def conjuction_judgement(
+    symbols: Mapping[str, Trinary], exclude: FrozenSet[str] = frozenset()
+):
+    judgement: Trinary = reduce(
+        operator.and_,
+        [status for (key, status) in symbols.items() if key not in exclude],
+        True,
+    )
+    return judgement
+
+
+def conjuction_judgement_weakly(
+    symbols: Mapping[str, Trinary], exclude: FrozenSet[str] = frozenset()
+):
+    judgement: Trinary = reduce(
+        operator.and_,
+        [weakly(status) for (key, status) in symbols.items() if key not in exclude],
+        True,
+    )
+    return judgement
+
+
+def conjuction_judgement_strictly(
+    symbols: Mapping[str, Trinary], exclude: FrozenSet[str] = frozenset()
+):
+    judgement: Trinary = reduce(
+        operator.and_,
+        [strictly(status) for (key, status) in symbols.items() if key not in exclude],
+        True,
+    )
+    return judgement
+
+
+def labels_to_symbols(lbls: FrozenSet[str]) -> Mapping[str, Trinary]:
+    symbols: Mapping[str, Trinary] = {
+        elem[0]: char_to_trinary(elem[1])
+        for elem in sorted([str(lbl).split("_") for lbl in lbls])
+    }
+    return symbols
+
+
+def provider_to_subproviders(
+    prov: il.LabelProvider[_T, str],
+    judgement_function: Callable[
+        [Mapping[str, Trinary]], Trinary
+    ] = conjuction_judgement,
+) -> Mapping[str, il.LabelProvider[_T, str]]:
+    keys = frozenset([lbl.split("_")[0] for lbl in prov.labelset])
+
+    def get_judgement(prov: il.InstanceProvider[_T, str]):
+        tuples = [
+            (idx, frozenset([str(judgement_function(labels_to_symbols(lbls)))]))
+            for idx, lbls in prov.items()
+        ]
+        new_prov = il.MemoryLabelProvider.from_tuples(tuples)
+        return new_prov
+
+    def get_subset(
+        prov: il.InstanceProvider[_T, str], key: str
+    ) -> il.InstanceProvider[_T, str]:
+        tuples = [
+            (idx, frozenset([lbl for lbl in lbls if key in lbl]))
+            for idx, lbls in prov.items()
+        ]
+        new_prov = il.MemoryLabelProvider.from_tuples(tuples)
+        return new_prov
+
+    return {
+        **{k: get_subset(prov, k) for k in keys},
+        **{"judgement": get_judgement(prov)},
+    }
+
+
+# %%
+pred_provider = answers_to_provider(objs)
+pred_df = ds_env.to_pandas(
+    ds_env.dataset, labels=pred_provider, label_viewer=symbol_label_viewer()
+)
+judgefunc = partial(conjuction_judgement_weakly, exclude=frozenset([]))
+
+preds = provider_to_subproviders(pred_provider, judgefunc)
+truths = provider_to_subproviders(ds_env.truth, judgefunc)
+# %%
+crit_key = "judgement"
+labels_sorted = sorted(list(truths[crit_key].labelset), reverse=True)
+clf = MockClassifierWrapper.from_provider(preds[crit_key])
+res = il.analysis.classifier_performance(clf, ds_env.dataset, truths[crit_key])
+res.confusion_matrix
+# %%
+fns = ds_env.create_bucket(res["True"].false_negatives)
+fps = ds_env.create_bucket(res["True"].false_positives)
+ds_env.to_pandas(
+    fns, labels=ds_env.truth, label_viewer=symbol_label_viewer()
+).join(pred_df, rsuffix="_pred").drop(columns=["data_pred"])
+#
+```
+
+```{python}
+#| warnings: false
+#| output: asis
+#| echo: false
+labeldiffs = {k: get_labeldiff(ds_env.truth[k], pred_provider[k]) for k in fps}
+strong_changes = value_map(strong_inclusion_change, labeldiffs)
+selection =  [(k, num_of_exclusions(ds_env.truth[k])) for k,strong_change in strong_changes.items()]
+
+
+selection_dict = {}
+for key, value in selection:
+    selection_dict.setdefault(value, list()).append(key)
+sorted_exclusions = sorted(list(selection_dict.keys()))
+for n_ex in sorted_exclusions:
+    keys = selection_dict[n_ex]
+    print(f"# Papers with {n_ex} exclusions according to the ground truth" + " {.unnumbered}")
+    print("")
+    print("")
+    for k in keys:
+        write_minipage(qa_dict[k])
+        print("")
+        print("")
+```

@@ -1,0 +1,15 @@
+python-allib
+environs
+langchain
+langchain-community
+langchain_openai
+openai
+transformers
+xlsxwriter
+parsec
+pylatex
+trinary
+torch
+torchvision
+torchaudio
+fuzzysearch
