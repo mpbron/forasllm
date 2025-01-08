@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14610767.svg)](https://doi.org/10.5281/zenodo.14610767)
+
 # Combining Large Language Model Classifications and Active Learning for Improved Technology-Assisted Review
 
 This repository contains the code to reproduce the results of the paper *Combining Large Language Model Classifications and Active Learning for Improved Technology-Assisted Review*.
